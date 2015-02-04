@@ -86,6 +86,12 @@ DEFINE_TYPE(double)
 %typemap(out) std::string; // Reset the typemap
 // ~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~
 
+%include "carrays.i"
+%array_class(uint32_t, UInt32Array);
+%array_class(int32_t, Int32Array);
+
+// ~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~
+
 namespace Halide {
 %ignore Internal;
 }
