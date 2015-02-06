@@ -21,12 +21,14 @@
 #include "SlidingWindow.h"
 #include "StorageFolding.h"
 #include "RemoveTrivialForLoops.h"
+#include "RemoveDeadAllocations.h"
 #include "Deinterleave.h"
 #include "DebugToFile.h"
 #include "EarlyFree.h"
 #include "UniquifyVariableNames.h"
 #include "SkipStages.h"
 #include "CSE.h"
+#include "SpecializeBranchedLoops.h"
 #include "SpecializeClampedRamps.h"
 #include "RemoveUndef.h"
 #include "AllocationBoundsInference.h"
@@ -40,6 +42,7 @@
 #include "FuseGPUThreadLoops.h"
 #include "InjectHostDevBufferCopies.h"
 #include "Memoization.h"
+#include "VaryingAttributes.h"
 
 namespace Halide {
 namespace Internal {
@@ -848,6 +851,25 @@ public:
     }
 };
 
+void realization_order_dfs(string current, map<string, set<string> > &graph, set<string> &visited, set<string> &result_set, vector<string> &order) {
+    set<string> &inputs = graph[current];
+    visited.insert(current);
+
+    for (set<string>::const_iterator i = inputs.begin();
+        i != inputs.end(); ++i) {
+
+        if (visited.find(*i) == visited.end()) {
+            realization_order_dfs(*i, graph, visited, result_set, order);
+        } else if (*i != current) {
+            internal_assert(result_set.find(*i) != result_set.end())
+                << "Stuck in a loop computing a realization order. Perhaps this pipeline has a loop?\n";
+        }
+    }
+
+    result_set.insert(current);
+    order.push_back(current);
+}
+
 vector<string> realization_order(string output, const map<string, Function> &env, map<string, set<string> > &graph) {
     // Make a DAG representing the pipeline. Each function maps to the set describing its inputs.
     // Populate the graph
@@ -861,42 +883,13 @@ vector<string> realization_order(string output, const map<string, Function> &env
         }
     }
 
-    vector<string> result;
+    vector<string> order;
     set<string> result_set;
+    set<string> visited;
 
-    while (true) {
-        // Find a function not in result_set, for which all its inputs are
-        // in result_set. Stop when we reach the output function.
-        bool scheduled_something = false;
-        // Inject a dummy use of this var in case asserts are off.
-        (void)scheduled_something;
-        for (map<string, Function>::const_iterator iter = env.begin();
-             iter != env.end(); ++iter) {
-            const string &f = iter->first;
-            if (result_set.find(f) == result_set.end()) {
-                bool good_to_schedule = true;
-                const set<string> &inputs = graph[f];
-                for (set<string>::const_iterator i = inputs.begin();
-                     i != inputs.end(); ++i) {
-                    if (*i != f && result_set.find(*i) == result_set.end()) {
-                        good_to_schedule = false;
-                    }
-                }
+    realization_order_dfs(output, graph, visited, result_set, order);
 
-                if (good_to_schedule) {
-                    scheduled_something = true;
-                    result_set.insert(f);
-                    result.push_back(f);
-                    debug(4) << "Realization order: " << f << "\n";
-                    if (f == output) return result;
-                }
-            }
-        }
-
-        internal_assert(scheduled_something)
-            << "Stuck in a loop computing a realization order. Perhaps this pipeline has a loop?\n";
-    }
-
+    return order;
 }
 
 Stmt create_initial_loop_nest(Function f, const Target &t) {
@@ -1116,7 +1109,29 @@ class RemoveLoopsOverOutermost : public IRMutator {
 
     void visit(const For *op) {
         if (ends_with(op->name, ".__outermost")) {
-            stmt = op->body;
+            stmt = mutate(op->body);
+        } else {
+            IRMutator::visit(op);
+        }
+    }
+
+    void visit(const Variable *op) {
+        if (ends_with(op->name, ".__outermost.loop_extent")) {
+            expr = 1;
+        } else if (ends_with(op->name, ".__outermost.loop_min")) {
+            expr = 0;
+        } else if (ends_with(op->name, ".__outermost.loop_max")) {
+            expr = 1;
+        } else {
+            expr = op;
+        }
+    }
+
+    void visit(const LetStmt *op) {
+        if (ends_with(op->name, ".__outermost.loop_extent") ||
+            ends_with(op->name, ".__outermost.loop_min") ||
+            ends_with(op->name, ".__outermost.loop_max")) {
+            stmt = mutate(op->body);
         } else {
             IRMutator::visit(op);
         }
@@ -1779,6 +1794,10 @@ Stmt lower(Function f, const Target &t, const vector<IRMutator *> &custom_passes
     s = allocation_bounds_inference(s, env, func_bounds);
     debug(2) << "Lowering after allocation bounds inference:\n" << s << '\n';
 
+    debug(1) << "Removing code that depends on undef values...\n";
+    s = remove_undef(s);
+    debug(2) << "Lowering after removing code that depends on undef values:\n" << s << "\n\n";
+
     // This uniquifies the variable names, so we're good to simplify
     // after this point. This lets later passes assume syntactic
     // equivalence means semantic equivalence.
@@ -1824,10 +1843,6 @@ Stmt lower(Function f, const Target &t, const vector<IRMutator *> &custom_passes
         debug(2) << "Lowering after injecting per-block gpu synchronization:\n" << s << "\n\n";
     }
 
-    debug(1) << "Removing code that depends on undef values...\n";
-    s = remove_undef(s);
-    debug(2) << "Lowering after removing code that depends on undef values:\n" << s << "\n\n";
-
     debug(1) << "Simplifying...\n";
     s = simplify(s);
     s = unify_duplicate_lets(s);
@@ -1854,6 +1869,13 @@ Stmt lower(Function f, const Target &t, const vector<IRMutator *> &custom_passes
     s = simplify(s);
     debug(2) << "Lowering after specializing clamped ramps:\n" << s << "\n\n";
 
+    debug(1) << "Specializing branched loops...\n";
+    s = specialize_branched_loops(s);
+    s = remove_dead_allocations(s);
+    s = simplify(s);
+    s = remove_trivial_for_loops(s);
+    debug(2) << "Lowering after specializing branched loops:\n" << s << "\n\n";
+
     debug(1) << "Injecting early frees...\n";
     s = inject_early_frees(s);
     debug(2) << "Lowering after injecting early frees:\n" << s << "\n\n";
@@ -1866,6 +1888,17 @@ Stmt lower(Function f, const Target &t, const vector<IRMutator *> &custom_passes
 
     debug(1) << "Simplifying...\n";
     s = common_subexpression_elimination(s);
+
+    if (t.has_feature(Target::OpenGL)) {
+        debug(1) << "Detecting varying attributes...\n";
+        s = find_linear_expressions(s);
+        debug(2) << "Lowering after detecting varying attributes:\n" << s << "\n\n";
+
+        debug(1) << "Moving varying attribute expressions out of the shader...\n";
+        s = setup_gpu_vertex_buffer(s);
+        debug(2) << "Lowering after removing varying attributes:\n" << s << "\n\n";
+    }
+
     s = simplify(s);
     debug(1) << "Lowering after final simplification:\n" << s << "\n\n";
 
@@ -1876,7 +1909,6 @@ Stmt lower(Function f, const Target &t, const vector<IRMutator *> &custom_passes
             debug(1) << "Lowering after custom pass " << i << ":\n" << s << "\n\n";
         }
     }
-
 
     return s;
 }

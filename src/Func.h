@@ -12,7 +12,7 @@
 #include "Param.h"
 #include "Argument.h"
 #include "RDom.h"
-#include "JITCompiledModule.h"
+#include "JITModule.h"
 #include "Image.h"
 #include "Target.h"
 #include "Tuple.h"
@@ -354,6 +354,30 @@ struct ErrorBuffer;
 class IRMutator;
 }
 
+
+struct Outputs {
+    std::string object_name;
+    std::string assembly_name;
+    std::string bitcode_name;
+
+    Outputs object(const std::string &object_name) {
+        Outputs updated = *this;
+        updated.object_name = object_name;
+        return updated;
+    }
+    Outputs assembly(const std::string &assembly_name) {
+        Outputs updated = *this;
+        updated.assembly_name = assembly_name;
+        return updated;
+    }
+    Outputs bitcode(const std::string &bitcode_name) {
+        Outputs updated = *this;
+        updated.bitcode_name = bitcode_name;
+        return updated;
+    }
+};
+
+
 /** A halide function. This class represents one stage in a Halide
  * pipeline, and is the unit by which we schedule things. By default
  * they are aggressively inlined, so you are encouraged to make lots
@@ -386,43 +410,12 @@ class Func {
 
     /** A JIT-compiled version of this function that we save so that
      * we don't have to rejit every time we want to evaluated it. */
-    Internal::JITCompiledModule compiled_module;
+    Internal::JITModule compiled_module;
 
     /** Invalidate the cached lowered stmt and compiled module. */
     void invalidate_cache();
 
-    /** The current error handler used for realizing this
-     * function. May be NULL. Only relevant when jitting. */
-    void (*error_handler)(void *user_context, const char *);
-
-    /** The current custom allocator used for realizing this
-     * function. May be NULL. Only relevant when jitting. */
-    // @{
-    void *(*custom_malloc)(void *user_context, size_t);
-    void (*custom_free)(void *user_context, void *ptr);
-    // @}
-
-    /** The current custom parallel task launcher and handler for
-     * realizing this function. May be NULL. */
-    // @{
-    int (*custom_do_par_for)(void *user_context,
-                             int (*)(void *, int, uint8_t *),
-                             int, int, uint8_t *);
-    int (*custom_do_task)(void *user_context, int (*)(void *, int, uint8_t *),
-                          int, uint8_t *);
-    // @}
-
-    /** The current custom tracing function. May be NULL. */
-    // @{
-    int32_t (*custom_trace)(void *, const halide_trace_event *);
-
-    // @}
-
-    /** The current print function used for realizing this
-     * function. May be NULL. Only relevant when jitting. */
-    void (*custom_print)(void *user_context, const char *);
-
-    uint64_t cache_size;
+    Halide::Internal::JITHandlers jit_handlers;
 
     /** The random seed to use for realizations of this function. */
     uint32_t random_seed;
@@ -453,10 +446,6 @@ class Func {
 
     /** A set of custom passes to use when lowering this Func. */
     std::vector<CustomLoweringPass> custom_lowering_passes;
-
-    /** Some infrastructure that helps Funcs catch and handle runtime
-     * errors in JIT-compiled code. */
-    bool prepare_to_catch_runtime_errors(Internal::ErrorBuffer *buf);
 
 public:
 
@@ -706,6 +695,17 @@ public:
                                 const Target &target = get_target_from_environment());
     // @}
 
+    /** Compile and generate multiple target files with single call.
+     * Deduces target files based on filenames specified in
+     * output_files struct.
+     */
+    //@{
+    EXPORT void compile_to(const Outputs &output_files,
+                           std::vector<Argument> args,
+                           const std::string &fn_name,
+                           const Target &target = get_target_from_environment());
+    // @}
+
     /** Eagerly jit compile the function to machine code. This
      * normally happens on the first call to realize. If you're
      * running your halide pipeline inside time-sensitive code and
@@ -800,7 +800,7 @@ public:
      * If you are statically compiling, you can also just define your
      * own versions of the tracing functions (see HalideRuntime.h),
      * and they will clobber Halide's versions. */
-    EXPORT void set_custom_trace(Internal::JITCompiledModule::TraceFn);
+    EXPORT void set_custom_trace(int (*trace_fn)(void *, const halide_trace_event *));
 
     /** Set the function called to print messages from the runtime.
      * If you are compiling statically, you can also just define your
@@ -811,12 +811,6 @@ public:
      * This will clobber Halide's version.
      */
     EXPORT void set_custom_print(void (*handler)(void *, const char *));
-
-    /** Set the maximum number of bytes used by memoization caching.
-     * If you are compiling statically, you should include HalideRuntime.h
-     * and call halide_memoization_cache_set_size() instead.
-     */
-    EXPORT void memoization_cache_set_size(uint64_t size);
 
     /** Add a custom pass to be used during lowering. It is run after
      * all other lowering passes. Can be used to verify properties of
